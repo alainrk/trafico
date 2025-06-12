@@ -88,8 +88,8 @@ func (g *GraphQLParser) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		graphqlReq.Query = string(body)
 	}
 
-	// Extract operations
-	queries, mutations := g.extractOperations(graphqlReq.Query)
+	// Extract resource names (root fields) instead of operation names
+	queries, mutations := g.extractResourceNames(graphqlReq.Query)
 
 	// Set headers
 	if len(queries) > 0 {
@@ -102,114 +102,190 @@ func (g *GraphQLParser) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	g.next.ServeHTTP(rw, req)
 }
 
-// extractOperations parses the GraphQL query and extracts operation names
-func (g *GraphQLParser) extractOperations(query string) ([]string, []string) {
+// extractResourceNames parses the GraphQL query and extracts root field names (resources)
+func (g *GraphQLParser) extractResourceNames(query string) ([]string, []string) {
 	var queries []string
 	var mutations []string
 
 	// Remove comments
 	query = removeComments(query)
 
-	// Regular expressions for different operation patterns
-	// Named operations
-	namedOpRe := regexp.MustCompile(`(?m)^\s*(query|mutation)\s+(\w+)`)
-	// Anonymous operations
-	anonQueryRe := regexp.MustCompile(`(?m)^\s*\{`)
-	anonMutationRe := regexp.MustCompile(`(?m)^\s*mutation\s*\{`)
-	// Field selections in anonymous queries
-	fieldRe := regexp.MustCompile(`\{\s*(\w+)`)
-
-	// Find named operations
-	matches := namedOpRe.FindAllStringSubmatch(query, -1)
-	for _, match := range matches {
-		if len(match) >= 3 {
-			opType := match[1]
-			opName := match[2]
-
-			switch opType {
-			case "query":
-				queries = append(queries, opName)
-			case "mutation":
-				mutations = append(mutations, opName)
-			}
-		}
-	}
-
-	// Check for anonymous operations if no named operations found
-	if len(queries) == 0 && len(mutations) == 0 {
-		// Check for anonymous mutation
-		if anonMutationRe.MatchString(query) {
-			// Extract mutation fields
-			fieldMatches := fieldRe.FindAllStringSubmatch(query, -1)
-			for _, match := range fieldMatches {
-				if len(match) >= 2 && !isGraphQLKeyword(match[1]) {
-					mutations = append(mutations, match[1])
-					break // Take first field as operation name
-				}
-			}
-		} else if anonQueryRe.MatchString(query) {
-			// Anonymous query - extract first field
-			fieldMatches := fieldRe.FindAllStringSubmatch(query, -1)
-			for _, match := range fieldMatches {
-				if len(match) >= 2 && !isGraphQLKeyword(match[1]) {
-					queries = append(queries, match[1])
-					break // Take first field as operation name
-				}
-			}
-		}
-	}
-
-	// If still no operations found, try to extract root fields
-	if len(queries) == 0 && len(mutations) == 0 {
-		// Look for operation type definitions
-		if strings.Contains(query, "mutation") {
-			mutations = g.extractRootFields(query, "mutation")
-		} else {
-			queries = g.extractRootFields(query, "query")
-		}
-	}
+	// Parse the query to extract root fields
+	queries = g.extractRootFieldsFromOperation(query, "query")
+	mutations = g.extractRootFieldsFromOperation(query, "mutation")
 
 	return queries, mutations
 }
 
-// extractRootFields extracts the root fields from a GraphQL operation
-func (g *GraphQLParser) extractRootFields(query string, opType string) []string {
+// extractRootFieldsFromOperation extracts root fields from a specific operation type
+func (g *GraphQLParser) extractRootFieldsFromOperation(query string, opType string) []string {
 	var fields []string
 
-	// Find the start of the operation
-	var startIdx int
-	if opType == "mutation" {
-		idx := strings.Index(query, "mutation")
-		if idx >= 0 {
-			startIdx = idx + len("mutation")
+	// Normalize whitespace
+	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
+	query = strings.TrimSpace(query)
+
+	var operationBlocks []string
+
+	if opType == "query" {
+		// Handle both named queries and anonymous queries
+		operationBlocks = g.findOperationBlocks(query, []string{"query", "anonymous"})
+	} else if opType == "mutation" {
+		operationBlocks = g.findOperationBlocks(query, []string{"mutation"})
+	}
+
+	// Extract root fields from each operation block
+	for _, block := range operationBlocks {
+		rootFields := g.parseRootFields(block)
+		fields = append(fields, rootFields...)
+	}
+
+	return fields
+}
+
+// findOperationBlocks finds operation blocks of the specified types
+func (g *GraphQLParser) findOperationBlocks(query string, opTypes []string) []string {
+	var blocks []string
+
+	for _, opType := range opTypes {
+		var pattern *regexp.Regexp
+
+		if opType == "anonymous" {
+			// Match anonymous queries (starting with {)
+			pattern = regexp.MustCompile(`^\s*\{`)
+		} else {
+			// Match named operations
+			pattern = regexp.MustCompile(`(?i)\b` + opType + `\s+\w+[^{]*\{`)
 		}
-	} else {
-		// For queries, start from the beginning or after "query"
-		idx := strings.Index(query, "query")
-		if idx >= 0 {
-			startIdx = idx + len("query")
+
+		matches := pattern.FindAllStringIndex(query, -1)
+		for _, match := range matches {
+			// Find the matching closing brace
+			block := g.extractBalancedBlock(query, match[0])
+			if block != "" {
+				blocks = append(blocks, block)
+			}
+		}
+
+		// Special case for anonymous queries
+		if opType == "anonymous" && len(blocks) == 0 {
+			// Check if the entire query is an anonymous query
+			if strings.HasPrefix(strings.TrimSpace(query), "{") {
+				blocks = append(blocks, query)
+			}
 		}
 	}
 
+	return blocks
+}
+
+// extractBalancedBlock extracts a balanced block starting from the given position
+func (g *GraphQLParser) extractBalancedBlock(query string, startPos int) string {
 	// Find the first opening brace
-	braceIdx := strings.Index(query[startIdx:], "{")
-	if braceIdx < 0 {
-		return fields
+	bracePos := strings.Index(query[startPos:], "{")
+	if bracePos < 0 {
+		return ""
 	}
-	startIdx += braceIdx + 1
 
-	// Extract fields until closing brace or nested selection
-	fieldRe := regexp.MustCompile(`^\s*(\w+)`)
-	remaining := query[startIdx:]
+	start := startPos + bracePos
+	braceCount := 0
+	inString := false
+	escaped := false
 
-	// Simple extraction of first-level fields
-	lines := strings.Split(remaining, "\n")
+	for i := start; i < len(query); i++ {
+		char := query[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if char == '\\' {
+			escaped = true
+			continue
+		}
+
+		if char == '"' {
+			inString = !inString
+			continue
+		}
+
+		if !inString {
+			if char == '{' {
+				braceCount++
+			} else if char == '}' {
+				braceCount--
+				if braceCount == 0 {
+					return query[start+1 : i] // Return content between braces
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// parseRootFields extracts root field names from an operation block
+func (g *GraphQLParser) parseRootFields(block string) []string {
+	var fields []string
+
+	// Remove nested selections by finding top-level fields only
+	lines := strings.Split(block, "\n")
+
 	for _, line := range lines {
-		matches := fieldRe.FindStringSubmatch(line)
-		if len(matches) >= 2 && !isGraphQLKeyword(matches[1]) {
-			fields = append(fields, matches[1])
-			// Only take the first field for operation name
-			break
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines, comments, and closing braces
+		if line == "" || strings.HasPrefix(line, "#") || line == "}" {
+			continue
+		}
+
+		// Match field pattern: fieldName or fieldName(args)
+		fieldPattern := regexp.MustCompile(`^(\w+)(?:\s*\(.*?\))?\s*[{:]?`)
+		matches := fieldPattern.FindStringSubmatch(line)
+
+		if len(matches) >= 2 {
+			fieldName := matches[1]
+
+			// Skip GraphQL keywords and directives
+			if !isGraphQLKeyword(fieldName) && !strings.HasPrefix(fieldName, "@") {
+				// Check if this is a root level field (not nested)
+				if !strings.Contains(line, "}") || strings.HasSuffix(strings.TrimSpace(line), "{") {
+					fields = append(fields, fieldName)
+				}
+			}
+		}
+	}
+
+	// Alternative approach: use regex to find top-level fields
+	if len(fields) == 0 {
+		// Look for patterns like "fieldName {" or "fieldName(args) {"
+		rootFieldPattern := regexp.MustCompile(`(?m)^[\s]*(\w+)(?:\s*\([^)]*\))?\s*\{`)
+		matches := rootFieldPattern.FindAllStringSubmatch(block, -1)
+
+		for _, match := range matches {
+			if len(match) >= 2 {
+				fieldName := match[1]
+				if !isGraphQLKeyword(fieldName) {
+					fields = append(fields, fieldName)
+				}
+			}
+		}
+	}
+
+	// Final fallback: simple field extraction
+	if len(fields) == 0 {
+		simpleFieldPattern := regexp.MustCompile(`(?m)^\s*(\w+)`)
+		matches := simpleFieldPattern.FindAllStringSubmatch(block, -1)
+
+		for _, match := range matches {
+			if len(match) >= 2 {
+				fieldName := match[1]
+				if !isGraphQLKeyword(fieldName) && !strings.HasPrefix(fieldName, "@") {
+					fields = append(fields, fieldName)
+					break // Take first valid field
+				}
+			}
 		}
 	}
 
@@ -234,6 +310,16 @@ func isGraphQLKeyword(word string) bool {
 		"true":         true,
 		"false":        true,
 		"null":         true,
+		"type":         true,
+		"input":        true,
+		"interface":    true,
+		"union":        true,
+		"enum":         true,
+		"scalar":       true,
+		"schema":       true,
+		"extend":       true,
+		"implements":   true,
+		"directive":    true,
 	}
 	return keywords[strings.ToLower(word)]
 }
