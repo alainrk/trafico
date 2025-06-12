@@ -1,0 +1,10 @@
+displayName: Trafico
+type: middleware
+
+import: github.com/alainrk/trafico
+
+summary: Parses GraphQL requests and extracts queries/mutations into custom headers
+
+testData:
+  queryHeader: X-GraphQL-Queries
+  mutationHeader: X-GraphQL-Mutations
