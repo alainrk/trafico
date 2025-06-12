@@ -229,67 +229,101 @@ func (g *GraphQLParser) extractBalancedBlock(query string, startPos int) string 
 func (g *GraphQLParser) parseRootFields(block string) []string {
 	var fields []string
 
-	// Remove nested selections by finding top-level fields only
-	lines := strings.Split(block, "\n")
+	// First, let's try a simpler approach - find all root-level fields in one pass
+	// This regex looks for field patterns at the beginning of the selection set
+	rootFieldPattern := regexp.MustCompile(`(?m)(\w+)(?:\s*\([^)]*\))?\s*\{[^}]*\}`)
+	matches := rootFieldPattern.FindAllStringSubmatch(block, -1)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines, comments, and closing braces
-		if line == "" || strings.HasPrefix(line, "#") || line == "}" {
-			continue
-		}
-
-		// Match field pattern: fieldName or fieldName(args)
-		fieldPattern := regexp.MustCompile(`^(\w+)(?:\s*\(.*?\))?\s*[{:]?`)
-		matches := fieldPattern.FindStringSubmatch(line)
-
-		if len(matches) >= 2 {
-			fieldName := matches[1]
-
-			// Skip GraphQL keywords and directives
+	for _, match := range matches {
+		if len(match) >= 2 {
+			fieldName := match[1]
 			if !isGraphQLKeyword(fieldName) && !strings.HasPrefix(fieldName, "@") {
-				// Check if this is a root level field (not nested)
-				if !strings.Contains(line, "}") || strings.HasSuffix(strings.TrimSpace(line), "{") {
-					fields = append(fields, fieldName)
-				}
+				fields = append(fields, fieldName)
 			}
 		}
 	}
 
-	// Alternative approach: use regex to find top-level fields
+	// If the above didn't work, try a more flexible approach
 	if len(fields) == 0 {
-		// Look for patterns like "fieldName {" or "fieldName(args) {"
-		rootFieldPattern := regexp.MustCompile(`(?m)^[\s]*(\w+)(?:\s*\([^)]*\))?\s*\{`)
-		matches := rootFieldPattern.FindAllStringSubmatch(block, -1)
+		// Split by lines and look for field patterns
+		lines := strings.Split(block, "\n")
+		braceLevel := 0
 
-		for _, match := range matches {
-			if len(match) >= 2 {
-				fieldName := match[1]
-				if !isGraphQLKeyword(fieldName) {
-					fields = append(fields, fieldName)
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+
+			// Skip empty lines and comments
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			// Count braces to determine nesting level
+			openBraces := strings.Count(line, "{")
+			closeBraces := strings.Count(line, "}")
+
+			// If we're at root level (braceLevel == 0), look for field names
+			if braceLevel == 0 {
+				fieldPattern := regexp.MustCompile(`^(\w+)(?:\s*\([^)]*\))?`)
+				matches := fieldPattern.FindStringSubmatch(line)
+
+				if len(matches) >= 2 {
+					fieldName := matches[1]
+					if !isGraphQLKeyword(fieldName) && !strings.HasPrefix(fieldName, "@") {
+						fields = append(fields, fieldName)
+					}
 				}
 			}
+
+			// Update brace level
+			braceLevel += openBraces - closeBraces
 		}
 	}
 
-	// Final fallback: simple field extraction
+	// Final fallback: parse the entire block more carefully
 	if len(fields) == 0 {
-		simpleFieldPattern := regexp.MustCompile(`(?m)^\s*(\w+)`)
-		matches := simpleFieldPattern.FindAllStringSubmatch(block, -1)
+		// Remove all content between nested braces to isolate root fields
+		simplified := g.simplifyToRootLevel(block)
+
+		// Now extract field names from the simplified version
+		fieldPattern := regexp.MustCompile(`(\w+)(?:\s*\([^)]*\))?`)
+		matches := fieldPattern.FindAllStringSubmatch(simplified, -1)
 
 		for _, match := range matches {
 			if len(match) >= 2 {
 				fieldName := match[1]
 				if !isGraphQLKeyword(fieldName) && !strings.HasPrefix(fieldName, "@") {
 					fields = append(fields, fieldName)
-					break // Take first valid field
 				}
 			}
 		}
 	}
 
 	return fields
+}
+
+// simplifyToRootLevel removes nested selections to help identify root fields
+func (g *GraphQLParser) simplifyToRootLevel(block string) string {
+	var result strings.Builder
+	braceLevel := 0
+
+	for _, char := range block {
+		if char == '{' {
+			braceLevel++
+			if braceLevel == 1 {
+				result.WriteRune(' ') // Replace opening brace with space
+			}
+		} else if char == '}' {
+			braceLevel--
+			if braceLevel == 0 {
+				result.WriteRune(' ') // Replace closing brace with space
+			}
+		} else if braceLevel == 0 {
+			// Only include characters that are at root level
+			result.WriteRune(char)
+		}
+	}
+
+	return result.String()
 }
 
 // removeComments removes GraphQL comments from the query
